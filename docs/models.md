@@ -13,3 +13,5 @@ Test set: 4 flat logos, a CC0 portrait with hair, a CC0 product photo on a busy 
 | RMBG-1.4 / 2.0 | non-commercial | | not used (license) |
 
 Flat-background cut (color key) beats every model on logos, so Auto uses it when the border is flat.
+
+Re-checked: WebGPU in Chromium on the RTX 5070 exposes no `shader-f16` and `maxStorageBuffersPerShaderStage` is 16, so BiRefNet lite still cannot run in the browser. Quality is raised instead by the refine step (see README), which removed the grey halo and fringe around the sample dog on both WebGPU and WASM.

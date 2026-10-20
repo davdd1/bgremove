@@ -1,5 +1,5 @@
 // Cache-first så att verktyget fungerar offline efter första laddningen.
-const CACHE = 'bgremove-v3';
+const CACHE = 'bgremove-v4';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'lib.mjs', 'samples/dog.jpg', 'samples/logo.png',
   'vendor/ort.webgpu.min.js', 'vendor/motion.js', 'vendor/ort-wasm-simd-threaded.jsep.mjs', 'vendor/ort-wasm-simd-threaded.jsep.wasm',
   'models/u2netp.onnx', 'models/modnet.onnx'];

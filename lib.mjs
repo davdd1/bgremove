@@ -170,3 +170,107 @@ export function coverage(mask) {
   let s = 0; for (let i = 0; i < mask.length; i++) s += mask[i] > 127 ? 1 : 0;
   return s / mask.length;
 }
+
+// ---- Maskförfining: kantsnap mot bilden, halo-städning, tunna delar och färgrening ----
+
+// Boxsuddighet (medelvärde i (2r+1)^2-fönster, kanter klampas) i O(n) med glidande summa.
+export function boxBlur(src, w, h, r) {
+  const tmp = new Float32Array(w * h), out = new Float32Array(w * h), k = 2 * r + 1;
+  for (let y = 0; y < h; y++) {
+    const o = y * w; let s = 0;
+    for (let x = -r; x <= r; x++) s += src[o + Math.min(w - 1, Math.max(0, x))];
+    for (let x = 0; x < w; x++) {
+      tmp[o + x] = s / k;
+      s += src[o + Math.min(w - 1, x + r + 1)] - src[o + Math.max(0, x - r)];
+    }
+  }
+  for (let x = 0; x < w; x++) {
+    let s = 0;
+    for (let y = -r; y <= r; y++) s += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
+    for (let y = 0; y < h; y++) {
+      out[y * w + x] = s / k;
+      s += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
+    }
+  }
+  return out;
+}
+
+// Guided filter (He et al.) med gråskaleguide: gör att maskens kant följer kanten i bilden i stället för modellens mjuka gissning.
+export function guidedFilter(guide, src, w, h, r, eps) {
+  const n = w * h;
+  const mI = boxBlur(guide, w, h, r), mP = boxBlur(src, w, h, r);
+  const ip = new Float32Array(n), ii = new Float32Array(n);
+  for (let i = 0; i < n; i++) { ip[i] = guide[i] * src[i]; ii[i] = guide[i] * guide[i]; }
+  const mIP = boxBlur(ip, w, h, r), mII = boxBlur(ii, w, h, r);
+  const a = new Float32Array(n), b = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const varI = mII[i] - mI[i] * mI[i], cov = mIP[i] - mI[i] * mP[i];
+    a[i] = cov / (varI + eps); b[i] = mP[i] - a[i] * mI[i];
+  }
+  const mA = boxBlur(a, w, h, r), mB = boxBlur(b, w, h, r), out = new Float32Array(n);
+  for (let i = 0; i < n; i++) out[i] = mA[i] * guide[i] + mB[i];
+  return out;
+}
+
+// Tar bort små lösa öar i masken (alfa > 127) som är mindre än minFrac av den största delen. Ändrar masken på plats.
+export function dropIslands(mask, w, h, minFrac = 0.02) {
+  const lab = new Int32Array(w * h), sizes = [0], stack = [];
+  let n = 0;
+  for (let s = 0; s < mask.length; s++) {
+    if (mask[s] <= 127 || lab[s]) continue;
+    n++; let cnt = 0; stack.push(s); lab[s] = n;
+    while (stack.length) {
+      const p = stack.pop(); cnt++;
+      const x = p % w, y = (p - x) / w;
+      if (x > 0 && mask[p - 1] > 127 && !lab[p - 1]) { lab[p - 1] = n; stack.push(p - 1); }
+      if (x < w - 1 && mask[p + 1] > 127 && !lab[p + 1]) { lab[p + 1] = n; stack.push(p + 1); }
+      if (y > 0 && mask[p - w] > 127 && !lab[p - w]) { lab[p - w] = n; stack.push(p - w); }
+      if (y < h - 1 && mask[p + w] > 127 && !lab[p + w]) { lab[p + w] = n; stack.push(p + w); }
+    }
+    sizes.push(cnt);
+  }
+  const big = Math.max(0, ...sizes);
+  if (!big) return mask;
+  const keep = sizes.map((c) => c >= big * minFrac);
+  // en kvarvarande del behåller sin mjuka kant: allt inom avstånd 3 px från en kvarvarande del får vara kvar
+  const grow = new Uint8Array(w * h);
+  for (let i = 0; i < mask.length; i++) if (lab[i] && keep[lab[i]]) grow[i] = 1;
+  const wide = boxBlur(Float32Array.from(grow), w, h, 3);
+  for (let i = 0; i < mask.length; i++) if (wide[i] === 0 && mask[i] > 0) mask[i] = 0;
+  return mask;
+}
+
+// Förfina en 0..255-mask mot bilden (rgba, w*h). Steg: guided filter -> kontrastkurva som nollar svag "dis"
+// och lyfter halvsvaga tunna delar -> släng lösa öar. opts.lo/hi styr kurvan (0..1).
+export function refineMask(mask, rgba, w, h, opts = {}) {
+  const { lo = 0.13, hi = 0.6, radius = Math.max(3, Math.round(Math.min(w, h) * 0.004)), eps = 2e-3 } = opts;
+  const n = w * h, guide = new Float32Array(n), a = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    guide[i] = (0.299 * rgba[i * 4] + 0.587 * rgba[i * 4 + 1] + 0.114 * rgba[i * 4 + 2]) / 255;
+    a[i] = mask[i] / 255;
+  }
+  const g = guidedFilter(guide, a, w, h, radius, eps);
+  const out = new Uint8ClampedArray(n);
+  for (let i = 0; i < n; i++) {
+    // filtret får lägga till och skärpa kanter men inte äta in i det modellen är säker på
+    const v = Math.max(g[i], a[i] * 0.95);
+    out[i] = Math.round(255 * smooth((v - lo) / (hi - lo)));
+  }
+  return dropIslands(out, w, h);
+}
+
+// Färgrening: pixlar med alfa < 1 får färg från närmaste säkra förgrund (normaliserad suddighet),
+// så att kanten inte bär med sig bakgrundens grå/färg. Ändrar rgba på plats.
+export function decontaminate(rgba, mask, w, h, r = Math.max(3, Math.round(Math.min(w, h) * 0.006))) {
+  const n = w * h, cr = new Float32Array(n), cg = new Float32Array(n), cb = new Float32Array(n), cw = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const c = mask[i] > 242 ? 1 : 0;
+    cw[i] = c; cr[i] = c * rgba[i * 4]; cg[i] = c * rgba[i * 4 + 1]; cb[i] = c * rgba[i * 4 + 2];
+  }
+  const R = boxBlur(cr, w, h, r), G = boxBlur(cg, w, h, r), B = boxBlur(cb, w, h, r), W = boxBlur(cw, w, h, r);
+  for (let i = 0; i < n; i++) {
+    if (mask[i] > 242 || mask[i] === 0 || W[i] < 0.02) continue;
+    rgba[i * 4] = R[i] / W[i]; rgba[i * 4 + 1] = G[i] / W[i]; rgba[i * 4 + 2] = B[i] / W[i];
+  }
+  return rgba;
+}

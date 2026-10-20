@@ -1,4 +1,4 @@
-import { MODELS, toTensorData, toMask, sharpen, fitSize, applyAlpha, outName, hexToRgb, fitBackground, isFlat, colorKey, coverage } from './lib.mjs';
+import { MODELS, toTensorData, toMask, sharpen, fitSize, applyAlpha, outName, hexToRgb, fitBackground, isFlat, colorKey, coverage, refineMask, decontaminate } from './lib.mjs';
 
 const $ = (id) => document.getElementById(id);
 const ort = window.ort;
@@ -109,6 +109,29 @@ async function modelMask(bitmap, key, w, h, stage) {
   return { mask, label: MODELS[key].label + (ep === 'webgpu' ? ' · WebGPU' : '') };
 }
 
+// Edge refinement (guided filter, halo cleanup, island removal). Very large images are refined at reduced size.
+function refineBig(mask, rgba, w, h) {
+  const cap = 10e6;
+  if (w * h <= cap) return refineMask(mask, rgba, w, h);
+  const k = Math.sqrt(cap / (w * h)), rw = Math.round(w * k), rh = Math.round(h * k);
+  const src = canvasOf(w, h); src.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(rgba), w, h), 0, 0);
+  const sm = canvasOf(rw, rh); sm.getContext('2d').drawImage(src, 0, 0, rw, rh);
+  const mc = canvasOf(w, h), mi = mc.getContext('2d').createImageData(w, h);
+  for (let i = 0; i < mask.length; i++) { mi.data[i * 4] = mi.data[i * 4 + 1] = mi.data[i * 4 + 2] = mask[i]; mi.data[i * 4 + 3] = 255; }
+  mc.getContext('2d').putImageData(mi, 0, 0);
+  const ms = canvasOf(rw, rh); ms.getContext('2d').drawImage(mc, 0, 0, rw, rh);
+  const sd = sm.getContext('2d').getImageData(0, 0, rw, rh).data, md = ms.getContext('2d').getImageData(0, 0, rw, rh).data;
+  const small = new Uint8ClampedArray(rw * rh); for (let i = 0; i < small.length; i++) small[i] = md[i * 4];
+  const r = refineMask(small, sd, rw, rh);
+  const o = canvasOf(rw, rh), oi = o.getContext('2d').createImageData(rw, rh);
+  for (let i = 0; i < r.length; i++) { oi.data[i * 4] = oi.data[i * 4 + 1] = oi.data[i * 4 + 2] = r[i]; oi.data[i * 4 + 3] = 255; }
+  o.getContext('2d').putImageData(oi, 0, 0);
+  const big = canvasOf(w, h); const bx = big.getContext('2d', { willReadFrequently: true }); bx.imageSmoothingQuality = 'high'; bx.drawImage(o, 0, 0, w, h);
+  const bd = bx.getImageData(0, 0, w, h).data, out = new Uint8ClampedArray(w * h);
+  for (let i = 0; i < out.length; i++) out[i] = bd[i * 4];
+  return out;
+}
+
 // Returns { cut, orig, mask, method }. mode: auto | portrait | flat | fast
 async function segment(bitmap, mode, crisp, stage) {
   const [w, h] = fitSize(bitmap.width, bitmap.height);
@@ -142,8 +165,13 @@ async function segment(bitmap, mode, crisp, stage) {
       r = await modelMask(bitmap, 'fast', w, h, stage);
     }
     mask = r.mask; label = r.label;
-    if (crisp || key === 'fast' || note) mask = sharpen(mask);
     px = fctx.getImageData(0, 0, w, h);
+    stage('Cleaning the edges');
+    await tick();
+    // SHORTCUT: refinement runs on the main thread at full size up to ~10 MP; bigger images are refined at reduced size (softer edges), move it to a worker if that matters
+    mask = refineBig(mask, px.data, w, h);
+    if (crisp) mask = sharpen(mask);
+    if (w * h <= 10e6) decontaminate(px.data, mask, w, h);
     applyAlpha(px.data, mask);
   } else if (crisp) {
     // colour-keyed edges are already antialiased; nothing to sharpen
