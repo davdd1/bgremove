@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remove Background from Image Free - Private, No Upload</title>
+<meta name="description" content="Remove the background from images for free, right in your browser. No upload, no signup, batch processing, transparent PNG download. Works offline.">
+<meta name="theme-color" content="#0f1115">
+<link rel="canonical" href="https://davdd1.github.io/bgremove/">
+<meta property="og:title" content="Remove Background from Image Free - Private, No Upload">
+<meta property="og:description" content="AI background remover that runs entirely in your browser. Your photos never leave your device.">
+<meta property="og:type" content="website">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"WebApplication","name":"Browser Background Remover","applicationCategory":"MultimediaApplication","operatingSystem":"Any","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"description":"Free background remover running fully in the browser."}
+</script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Remove background from image, free</h1>
+  <p class="sub">Runs 100% in your browser. Your photos are never uploaded. Works offline after the first load.</p>
+</header>
+
+<main>
+  <section id="drop" tabindex="0" aria-label="Drop images here">
+    <p class="big">Drop images here</p>
+    <p>or <label class="btn"><input id="file" type="file" accept="image/*" multiple hidden>Choose images</label>
+       <button id="sample" class="btn ghost" type="button">Try a sample</button></p>
+    <p class="hint">JPG, PNG, WebP. Select as many as you like, they are processed one by one.</p>
+  </section>
+
+  <section id="controls" aria-label="Options">
+    <label>Model
+      <select id="model">
+        <option value="general">General (objects, animals, products)</option>
+        <option value="portrait">Portrait (people)</option>
+      </select>
+    </label>
+    <label>Background
+      <select id="bg">
+        <option value="transparent">Transparent</option>
+        <option value="color">Solid color</option>
+        <option value="blur">Blurred original</option>
+      </select>
+    </label>
+    <label id="colorLabel" hidden>Color <input id="color" type="color" value="#ffffff"></label>
+    <label id="blurLabel" hidden>Blur <input id="blur" type="range" min="2" max="40" value="14"></label>
+    <label class="chk"><input id="crisp" type="checkbox" checked> Crisp edges</label>
+    <button id="dlall" class="btn" type="button" disabled>Download all</button>
+  </section>
+
+  <p id="status" role="status"></p>
+  <section id="results"></section>
+
+  <article class="explain">
+    <h2>How to remove the background from an image for free</h2>
+    <ol>
+      <li>Drop one or many images onto the box above.</li>
+      <li>Wait a few seconds per image. An AI segmentation model runs on your own device.</li>
+      <li>Drag the slider to compare before and after, optionally pick a new background, then download the transparent PNG.</li>
+    </ol>
+    <h2>Is it really free and private?</h2>
+    <p>Yes. There is no server: the model is downloaded once and runs locally with WebAssembly. No image is sent anywhere, there is no account, no watermark and no limit on resolution beyond your device memory.</p>
+    <h2>Which models does it use?</h2>
+    <p>U<sup>2</sup>-Netp for general subjects and MODNet for portraits, both Apache-2.0 licensed, so results can be used commercially. Segmentation quality is good for clear subjects and weaker on hair, glass and cluttered scenes.</p>
+    <h2>Does it work offline?</h2>
+    <p>After the first visit the page, the runtime and the models are cached by your browser, so it keeps working without internet.</p>
+  </article>
+</main>
+
+<footer>Open tools, no tracking. Models: U<sup>2</sup>-Net (Apache-2.0), MODNet (Apache-2.0). Runtime: ONNX Runtime Web (MIT).</footer>
+<script src="vendor/ort.wasm.min.js"></script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
