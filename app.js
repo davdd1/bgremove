@@ -1,46 +1,100 @@
-import { MODELS, toTensorData, toMask, sharpen, fitSize, applyAlpha, outName, hexToRgb } from './lib.mjs';
+import { MODELS, toTensorData, toMask, sharpen, fitSize, applyAlpha, outName, hexToRgb, fitBackground, isFlat, colorKey, coverage } from './lib.mjs';
 
 const $ = (id) => document.getElementById(id);
 const ort = window.ort;
 ort.env.wasm.wasmPaths = new URL('vendor/', location.href).href;
-ort.env.wasm.numThreads = 1; // SHORTCUT: single thread avoids COOP/COEP headers; enable threads if hosting sets them
+ort.env.wasm.numThreads = 1; // SHORTCUT: single thread avoids COOP/COEP headers; a service-worker header shim would allow threads (4-8x faster on CPU)
+ort.env.wasm.proxy = true; // inference in a worker so the page keeps animating
 
 // Motion is optional: without it (or with reduced motion) everything still works, just without easing.
 const M = window.Motion;
 const calm = matchMedia('(prefers-reduced-motion: reduce)');
+const fancy = () => !!M && !calm.matches;
 const spring = { type: 'spring', stiffness: 320, damping: 26 };
-const anim = (el, kf, opt) => (M && !calm.matches ? M.animate(el, kf, opt) : null);
+const ease = [0.22, 1, 0.36, 1];
+const anim = (el, kf, opt) => (fancy() ? M.animate(el, kf, opt) : null);
+const tick = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
 
 const sessions = {};
 const items = [];
 let queue = Promise.resolve();
+let sink = null; // progress callback of the item that is currently being processed
 
-async function getSession(key) {
-  if (!sessions[key]) {
-    sessions[key] = (async () => {
-      const buf = await (await fetch(MODELS[key].file)).arrayBuffer();
-      return ort.InferenceSession.create(buf, { executionProviders: ['wasm'] });
-    })();
+// ---------- models ----------
+
+let gpuOK = null;
+async function hasGpu() {
+  if (gpuOK !== null) return gpuOK;
+  try { gpuOK = !!(navigator.gpu && (await navigator.gpu.requestAdapter())); } catch { gpuOK = false; }
+  return gpuOK;
+}
+
+// Remote weights are streamed with progress and kept in the Cache API, so the download happens once.
+async function fetchModel(url, bytes) {
+  let cache = null;
+  try { cache = await caches.open('bgremove-models'); const hit = await cache.match(url); if (hit) return new Uint8Array(await hit.arrayBuffer()); } catch { /* no cache available */ }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Model download failed (' + res.status + ')');
+  const total = +res.headers.get('content-length') || bytes;
+  const rd = res.body.getReader(); const parts = []; let got = 0;
+  for (;;) {
+    const { done, value } = await rd.read(); if (done) break;
+    parts.push(value); got += value.length;
+    if (sink) sink({ loaded: got, total });
   }
+  const buf = new Uint8Array(got); let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; }
+  try { if (cache) await cache.put(url, new Response(buf)); } catch { /* quota: fine, just re-download next time */ }
+  return buf;
+}
+
+async function makeSession(key) {
+  const cfg = MODELS[key];
+  if (cfg.file) {
+    const buf = await (await fetch(cfg.file)).arrayBuffer();
+    return { s: await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] }), ep: 'wasm' };
+  }
+  if (await hasGpu()) {
+    try {
+      const buf = await fetchModel(cfg.remote.gpu, cfg.remote.gpuBytes);
+      return { s: await ort.InferenceSession.create(buf, { executionProviders: ['webgpu'] }), ep: 'webgpu' };
+    } catch (e) { console.warn('WebGPU failed, using CPU', e); }
+  }
+  const buf = await fetchModel(cfg.remote.cpu, cfg.remote.cpuBytes);
+  return { s: await ort.InferenceSession.create(buf, { executionProviders: ['wasm'] }), ep: 'wasm' };
+}
+
+function getSession(key) {
+  if (!sessions[key]) sessions[key] = makeSession(key).catch((e) => { delete sessions[key]; throw e; });
   return sessions[key];
 }
 
 function canvasOf(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
 
-async function segment(bitmap, key, crisp) {
+async function modelMask(bitmap, key, w, h, stage) {
   const cfg = MODELS[key];
-  const [w, h] = fitSize(bitmap.width, bitmap.height);
-  const full = canvasOf(w, h);
-  const fctx = full.getContext('2d', { willReadFrequently: true });
-  fctx.drawImage(bitmap, 0, 0, w, h);
+  stage('Loading the model', 0);
+  let { s: session, ep } = await getSession(key);
+  stage('Finding the subject');
+  await tick();
   const small = canvasOf(cfg.size, cfg.size);
   const sctx = small.getContext('2d', { willReadFrequently: true });
   sctx.drawImage(bitmap, 0, 0, cfg.size, cfg.size);
   const input = toTensorData(sctx.getImageData(0, 0, cfg.size, cfg.size).data, cfg.size, cfg);
-  const session = await getSession(key);
-  const res = await session.run({ [session.inputNames[0]]: new ort.Tensor('float32', input, [1, 3, cfg.size, cfg.size]) });
-  const out = res[session.outputNames[0]].data;
-  const m = toMask(out, key === 'general');
+  const feed = () => ({ [session.inputNames[0]]: new ort.Tensor('float32', input, [1, 3, cfg.size, cfg.size]) });
+  let res;
+  try { res = await session.run(feed()); }
+  catch (e) {
+    if (ep !== 'webgpu') throw e;
+    // some GPUs/drivers cannot run the graph: drop WebGPU for good and redo it on the CPU
+    console.warn('WebGPU run failed, using CPU', e); gpuOK = false; delete sessions[key];
+    stage('Loading the model', 0); ({ s: session, ep } = await getSession(key)); stage('Finding the subject'); await tick();
+    res = await session.run(feed());
+  }
+  const t = res[session.outputNames[0]];
+  const out = t.data ?? (await t.getData());
+  stage('Cleaning the edges');
+  await tick();
+  const m = toMask(out, cfg.minmax, cfg.sigmoid);
   const mc = canvasOf(cfg.size, cfg.size);
   const mimg = mc.getContext('2d').createImageData(cfg.size, cfg.size);
   for (let i = 0; i < m.length; i++) { mimg.data[i * 4] = mimg.data[i * 4 + 1] = mimg.data[i * 4 + 2] = m[i]; mimg.data[i * 4 + 3] = 255; }
@@ -50,14 +104,56 @@ async function segment(bitmap, key, crisp) {
   uctx.imageSmoothingQuality = 'high';
   uctx.drawImage(mc, 0, 0, w, h);
   const upPx = uctx.getImageData(0, 0, w, h).data;
-  let mask = new Uint8ClampedArray(w * h);
+  const mask = new Uint8ClampedArray(w * h);
   for (let i = 0; i < mask.length; i++) mask[i] = upPx[i * 4];
-  if (crisp) mask = sharpen(mask);
-  const px = fctx.getImageData(0, 0, w, h);
-  applyAlpha(px.data, mask);
+  return { mask, label: MODELS[key].label + (ep === 'webgpu' ? ' · WebGPU' : '') };
+}
+
+// Returns { cut, orig, mask, method }. mode: auto | portrait | flat | fast
+async function segment(bitmap, mode, crisp, stage) {
+  const [w, h] = fitSize(bitmap.width, bitmap.height);
+  const full = canvasOf(w, h);
+  const fctx = full.getContext('2d', { willReadFrequently: true });
+  fctx.drawImage(bitmap, 0, 0, w, h);
+  let px = fctx.getImageData(0, 0, w, h);
+  let mask = null, label = '';
+
+  if (mode === 'auto' || mode === 'flat') {
+    stage('Checking the background');
+    await tick();
+    const fit = fitBackground(px.data, w, h);
+    if (mode === 'flat' || isFlat(fit)) {
+      const keyed = new Uint8ClampedArray(px.data);
+      const km = colorKey(keyed, w, h, fit);
+      const cov = coverage(km);
+      if (mode === 'flat' || (cov > 0.002 && cov < 0.9)) { px.data.set(keyed); mask = km; label = 'Color key'; }
+    }
+    if (mask) { stage('Cutting by color'); await tick(); }
+  }
+  let note = '';
+  if (!mask) {
+    const key = mode === 'portrait' ? 'portrait' : mode === 'fast' ? 'fast' : 'quality';
+    let r;
+    try { r = await modelMask(bitmap, key, w, h, stage); }
+    catch (e) {
+      if (key !== 'quality') throw e;
+      console.warn('Quality model unavailable, using Quick', e);
+      note = 'offline, used Quick';
+      r = await modelMask(bitmap, 'fast', w, h, stage);
+    }
+    mask = r.mask; label = r.label;
+    if (crisp || key === 'fast' || note) mask = sharpen(mask);
+    px = fctx.getImageData(0, 0, w, h);
+    applyAlpha(px.data, mask);
+  } else if (crisp) {
+    // colour-keyed edges are already antialiased; nothing to sharpen
+  }
   const cut = canvasOf(w, h);
   cut.getContext('2d').putImageData(px, 0, 0);
-  return { cut, orig: full };
+  // light subjects (white text on a logo) vanish on a pale transparency grid, so the card switches to a darker one
+  let sum = 0, n = 0;
+  for (let i = 0; i < mask.length; i += 7) if (mask[i] > 200) { sum += (0.2126 * px.data[i * 4] + 0.7152 * px.data[i * 4 + 1] + 0.0722 * px.data[i * 4 + 2]) / 255; n++; }
+  return { cut, orig: full, mask, light: n > 20 && sum / n > 0.72, method: label + (note ? ' (' + note + ')' : '') };
 }
 
 function composite(it) {
@@ -83,16 +179,40 @@ function render(it) {
   it.out = out;
 }
 
+// ---------- cards ----------
+
 function makeCard(it) {
   const el = document.createElement('div');
   el.className = 'card';
-  el.innerHTML = `<div class="cmp"><div class="ph busy">Working on it</div></div>
+  el.innerHTML = `<div class="cmp busy queued">
+      <canvas class="pre"></canvas>
+      <div class="scan" aria-hidden="true"></div><div class="shimmer" aria-hidden="true"></div>
+      <div class="bar" aria-hidden="true"><i></i></div>
+      <div class="stage" role="status"><span class="dot" aria-hidden="true"></span><span class="msg">Waiting</span><span class="pct"></span></div>
+    </div>
     <div class="row"><span></span><button class="btn" disabled>Download PNG</button></div>`;
   el.querySelector('.row span').textContent = it.name;
   it.el = el;
   el.querySelector('button').onclick = () => download(it);
   $('results').append(el);
-  anim(el, { opacity: [0, 1], y: [18, 0], scale: [0.98, 1] }, spring);
+  anim(el, { opacity: [0, 1], y: [26, 0], scale: [0.96, 1] }, { ...spring, delay: 0.02 });
+}
+
+function drawPreview(it) {
+  const c = it.el.querySelector('canvas.pre');
+  const [w, h] = fitSize(it.bmp.width, it.bmp.height, 1200);
+  c.width = w; c.height = h; c.getContext('2d').drawImage(it.bmp, 0, 0, w, h);
+}
+
+function makeStage(it) {
+  const cmp = it.el.querySelector('.cmp');
+  const msg = cmp.querySelector('.msg'), pct = cmp.querySelector('.pct'), bar = cmp.querySelector('.bar i');
+  cmp.classList.remove('queued');
+  return (text, frac) => {
+    msg.textContent = text;
+    if (frac === undefined) { pct.textContent = ''; bar.style.transform = ''; cmp.classList.remove('det'); return; }
+    cmp.classList.add('det'); bar.style.transform = `scaleX(${frac})`; pct.textContent = frac ? Math.round(frac * 100) + '%' : '';
+  };
 }
 
 function attachSlider(it) {
@@ -106,7 +226,7 @@ function attachSlider(it) {
   cmp.append(before, handle, tl, tr);
   cmp.tabIndex = 0; cmp.setAttribute('role', 'slider'); cmp.setAttribute('aria-label', 'Before and after');
   cmp.setAttribute('aria-valuemin', '0'); cmp.setAttribute('aria-valuemax', '100');
-  let pos = 50, sweep = null;
+  let pos = 0, sweep = null;
   const put = (p) => {
     pos = Math.min(100, Math.max(0, p));
     before.style.clipPath = `inset(0 ${100 - pos}% 0 0)`; handle.style.left = pos + '%';
@@ -116,7 +236,7 @@ function attachSlider(it) {
   const fromX = (x) => { const r = cmp.getBoundingClientRect(); return (x - r.left) / r.width * 100; };
   const glide = (to) => {
     if (sweep) sweep.stop();
-    if (!M || calm.matches) return put(to);
+    if (!fancy()) return put(to);
     sweep = M.animate(pos, to, { ...spring, onUpdate: put });
   };
   cmp.addEventListener('pointerdown', (e) => {
@@ -131,8 +251,63 @@ function attachSlider(it) {
     const k = { ArrowLeft: -5, ArrowRight: 5, Home: -100, End: 100 }[e.key];
     if (k === undefined) return; e.preventDefault(); glide(pos + k);
   });
-  // first reveal: start on the original and sweep to the cut-out so the comparison explains itself
-  if (M && !calm.matches) { put(100); setTimeout(() => glide(50), 250); } else put(50);
+  put(fancy() ? 0 : 50);
+  return { nudge() { if (!fancy()) return; handle.style.opacity = 0; anim(handle, { opacity: [0, 1] }, { duration: 0.4 }); setTimeout(() => glide(16), 350); setTimeout(() => glide(0), 1000); } };
+}
+
+// The signature moment: the background breaks into tiles that shrink and drift away from left to right,
+// leaving the subject standing on the transparency grid, with a light edge running ahead of the wave.
+function playReveal(it, slider) {
+  const cmp = it.el.querySelector('.cmp');
+  const after = it.out;
+  const long = Math.min(1100, Math.max(after.width, after.height));
+  const k = long / Math.max(after.width, after.height);
+  const W = Math.max(2, Math.round(after.width * k)), H = Math.max(2, Math.round(after.height * k));
+  // peel source: the original with the subject cut out (alpha = 1 - mask)
+  const full = canvasOf(it.orig.width, it.orig.height);
+  const fx = full.getContext('2d');
+  fx.drawImage(it.orig, 0, 0);
+  const id = fx.getImageData(0, 0, full.width, full.height);
+  for (let i = 0; i < it.mask.length; i++) id.data[i * 4 + 3] = 255 - it.mask[i];
+  fx.putImageData(id, 0, 0);
+  const src = canvasOf(W, H); src.getContext('2d').drawImage(full, 0, 0, W, H);
+  const peel = canvasOf(W, H); peel.className = 'peel';
+  const edge = document.createElement('div'); edge.className = 'edge';
+  cmp.append(peel, edge);
+  const pctx = peel.getContext('2d');
+  const cols = 30, ts = W / cols, rows = Math.ceil(H / ts);
+  const jit = new Float32Array(cols * rows); for (let i = 0; i < jit.length; i++) jit[i] = Math.random();
+  const frame = (p) => {
+    pctx.clearRect(0, 0, W, H);
+    if (p <= 0) { pctx.drawImage(src, 0, 0); return; }
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+      const u = (c + 0.5) / cols, v = (r + 0.5) / rows;
+      const s = u * 0.62 + jit[r * cols + c] * 0.14 + Math.abs(v - 0.5) * 0.06;
+      const t = Math.min(1, Math.max(0, (p - s) / 0.24));
+      if (t >= 1) continue;
+      const x = c * ts, y = r * ts, sw = Math.min(ts, W - x), sh = Math.min(ts, H - y);
+      const e = t * t * (3 - 2 * t), sc = 1 - 0.6 * e;
+      pctx.globalAlpha = 1 - e;
+      const dw = sw * sc + (t ? 0 : 0.6), dh = sh * sc + (t ? 0 : 0.6);
+      pctx.drawImage(src, x, y, sw, sh, x + (sw - dw) / 2 + e * ts * 0.35, y + (sh - dh) / 2 - e * ts * 0.9, dw, dh);
+    }
+    pctx.globalAlpha = 1;
+  };
+  frame(0);
+  cmp.classList.add('revealing');
+  const finish = () => { peel.remove(); edge.remove(); cmp.classList.remove('revealing'); slider.nudge(); };
+  return new Promise((res) => {
+    M.animate(0, 1, {
+      duration: 1.7, ease: [0.5, 0, 0.25, 1],
+      onUpdate: (p) => {
+        frame(p);
+        const front = Math.min(1.12, p / 0.7);
+        edge.style.left = front * 100 + '%'; edge.style.opacity = Math.max(0, Math.min(1, (1.08 - front) * 6));
+      },
+      onComplete: () => { finish(); res(); },
+    });
+    anim(after, { scale: [1, 1.03, 1], filter: ['drop-shadow(0 0 0 rgba(25,24,21,0))', 'drop-shadow(0 10px 18px rgba(25,24,21,.32))', 'drop-shadow(0 0 0 rgba(25,24,21,0))'] }, { duration: 1.9, ease: 'easeInOut' });
+  });
 }
 
 function download(it) {
@@ -156,19 +331,34 @@ function addFile(file) {
   drop.classList.add('compact'); document.body.classList.add('used');
   const it = { name: file.name || 'image', file };
   items.push(it); makeCard(it); updateStatus();
+  const mode = $('model').value, crisp = $('crisp').checked;
+  const ready = createImageBitmap(file).then((b) => { it.bmp = b; drawPreview(it); return b; });
+  ready.catch(() => {});
   queue = queue.then(async () => {
     const t0 = performance.now();
+    const cmp = it.el.querySelector('.cmp');
+    const stage = makeStage(it);
+    sink = ({ loaded, total }) => stage('Downloading the model, once', Math.min(1, loaded / total));
     try {
-      const bmp = await createImageBitmap(file);
-      const r = await segment(bmp, $('model').value, $('crisp').checked);
-      Object.assign(it, r, { bmp, ms: Math.round(performance.now() - t0) });
-      it.el.querySelector('.cmp').innerHTML = '';
-      render(it); attachSlider(it);
-      anim(it.el.querySelector('.cmp canvas.after'), { opacity: [0, 1] }, { duration: 0.4 });
+      stage('Reading the image');
+      const bmp = await ready;
+      await tick();
+      const r = await segment(bmp, mode, crisp, stage);
+      sink = null;
+      Object.assign(it, r, { ms: Math.round(performance.now() - t0) });
+      const dwell = 1000 - (performance.now() - t0); // let the processing state be seen even when the cut is instant
+      if (fancy() && dwell > 0) await new Promise((r) => setTimeout(r, dwell));
+      render(it);
+      cmp.classList.toggle('dark-grid', !!it.light);
+      cmp.classList.remove('busy', 'det');
+      cmp.querySelectorAll('.scan,.shimmer,.bar,.stage,canvas.pre').forEach((n) => n.remove());
+      const slider = attachSlider(it);
       it.el.querySelector('button').disabled = false;
-      it.el.querySelector('.row span').textContent = `${it.name} · ${(it.ms / 1000).toFixed(1)} s`;
+      it.el.querySelector('.row span').textContent = `${it.name} · ${(it.ms / 1000).toFixed(1)} s · ${it.method}`;
+      if (fancy()) await playReveal(it, slider); else slider.nudge();
     } catch (e) {
-      it.failed = true; it.el.querySelector('.cmp').innerHTML = '<div class="ph">Could not process this file.<br><small></small></div>'; it.el.querySelector('small').textContent = String(e.message || e);
+      sink = null;
+      it.failed = true; cmp.className = 'cmp'; cmp.innerHTML = '<div class="ph">Could not process this file.<br><small></small></div>'; cmp.querySelector('small').textContent = String(e.message || e);
       console.error(e);
     }
     updateStatus();
@@ -177,18 +367,44 @@ function addFile(file) {
 
 function addFiles(list) { for (const f of list) if (f.type.startsWith('image/')) addFile(f); }
 
+// ---------- drop zone ----------
+
 const drop = $('drop');
 const frame = drop.querySelector('.frame');
-const lock = (on) => anim(frame, { scale: on ? 1.035 : 1 }, spring);
-['dragenter', 'dragover'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); if (!drop.classList.contains('over')) { drop.classList.add('over'); lock(true); } }));
-['dragleave', 'drop'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); if (drop.classList.contains('over')) { drop.classList.remove('over'); lock(false); } }));
-drop.addEventListener('pointerenter', () => { if (!drop.classList.contains('over')) anim(frame, { scale: 1.015 }, spring); });
+const corners = [...frame.querySelectorAll('i')];
+let depth = 0;
+const lock = (on) => {
+  if (on) {
+    anim(frame, { scale: 0.94 }, { type: 'spring', stiffness: 260, damping: 14 });
+    anim(drop, { scale: 1.015 }, { type: 'spring', stiffness: 300, damping: 18 });
+    anim(corners, { scale: [1.9, 1], rotate: [0, 0] }, { type: 'spring', stiffness: 420, damping: 16, delay: M ? M.stagger(0.04) : 0 });
+  } else {
+    anim(frame, { scale: 1 }, spring); anim(drop, { scale: 1 }, spring);
+  }
+};
+const setOver = (on) => {
+  if (on === drop.classList.contains('over')) return;
+  drop.classList.toggle('over', on); document.body.classList.toggle('dragging', on); lock(on);
+};
+// the whole window accepts a drop, the zone just reacts the loudest
+window.addEventListener('dragenter', (e) => { e.preventDefault(); depth++; setOver(true); });
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('dragleave', () => { depth = Math.max(0, depth - 1); if (!depth) setOver(false); });
+window.addEventListener('drop', (e) => {
+  e.preventDefault(); depth = 0; setOver(false);
+  anim(drop, { scale: [1.03, 1] }, { type: 'spring', stiffness: 500, damping: 14 });
+  addFiles(e.dataTransfer.files);
+});
+drop.addEventListener('pointerenter', () => { if (!drop.classList.contains('over')) anim(frame, { scale: 1.03 }, spring); });
 drop.addEventListener('pointerleave', () => { if (!drop.classList.contains('over')) anim(frame, { scale: 1 }, spring); });
-drop.addEventListener('drop', (e) => addFiles(e.dataTransfer.files));
 document.addEventListener('paste', (e) => addFiles(e.clipboardData?.files || []));
 $('file').onchange = (e) => { addFiles(e.target.files); e.target.value = ''; };
-$('sample').onclick = async () => { const b = await (await fetch('samples/dog.jpg')).blob(); addFiles([new File([b], 'sample.jpg', { type: b.type })]); };
+const sample = (url, name, type) => async () => { const b = await (await fetch(url)).blob(); addFiles([new File([b], name, { type: b.type || type })]); };
+$('sample').onclick = sample('samples/dog.jpg', 'sample.jpg', 'image/jpeg');
+$('sample2').onclick = sample('samples/logo.png', 'logo.png', 'image/png');
 $('dlall').onclick = () => items.filter((i) => i.out).forEach((i, n) => setTimeout(() => download(i), n * 400)); // SHORTCUT: sequential downloads, no zip; add a zip writer for big batches
+
+// ---------- controls ----------
 
 function reveal(el, show) {
   if (!show) { el.hidden = true; return; }
@@ -196,12 +412,25 @@ function reveal(el, show) {
   if (was) anim(el, { opacity: [0, 1], x: [-8, 0] }, spring);
 }
 
+// a sliding thumb behind the selected segment instead of a hard swap
+function placeThumb(seg, instant) {
+  const thumb = seg.querySelector('.thumb'); const b = seg.querySelector('[aria-checked=true]');
+  if (!thumb || !b || !b.offsetWidth) return;
+  const to = { x: b.offsetLeft, width: b.offsetWidth };
+  if (instant || !fancy()) { thumb.style.transform = `translateX(${to.x}px)`; thumb.style.width = to.width + 'px'; }
+  else M.animate(thumb, { transform: `translateX(${to.x}px)`, width: to.width + 'px' }, spring);
+}
+
 document.querySelectorAll('.seg').forEach((seg) => {
   const sel = $(seg.dataset.for);
+  const thumb = document.createElement('i'); thumb.className = 'thumb'; seg.prepend(thumb); seg.classList.add('has-thumb');
+  placeThumb(seg, true);
+  new ResizeObserver(() => placeThumb(seg, true)).observe(seg);
   seg.addEventListener('click', (e) => {
     const b = e.target.closest('button'); if (!b) return;
     seg.querySelectorAll('button').forEach((x) => x.setAttribute('aria-checked', String(x === b)));
-    sel.value = b.dataset.v; sel.dispatchEvent(new Event('input'));
+    sel.value = b.dataset.v; sel.dispatchEvent(new Event('input')); placeThumb(seg);
+    anim(b, { scale: [0.94, 1] }, spring);
   });
   seg.addEventListener('keydown', (e) => {
     const d = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[e.key]; if (!d) return;
@@ -209,6 +438,7 @@ document.querySelectorAll('.seg').forEach((seg) => {
     const n = bs[(i + d + bs.length) % bs.length]; e.preventDefault(); n.click(); n.focus();
   });
 });
+document.fonts?.ready.then(() => document.querySelectorAll('.seg').forEach((s) => placeThumb(s, true)));
 
 function syncBg() {
   const m = $('bg').value;
@@ -217,10 +447,34 @@ function syncBg() {
 }
 ['bg', 'color', 'blur'].forEach((id) => $(id).addEventListener('input', syncBg));
 
-if (M && !calm.matches) {
-  M.animate('.top, .hero h1, .lede, #drop', { opacity: [0, 1], y: [10, 0] }, { duration: 0.6, delay: M.stagger(0.07), ease: [0.22, 1, 0.36, 1] });
-  M.inView('.notes', (el) => { M.animate(el, { opacity: [0, 1], y: [14, 0] }, { duration: 0.6, ease: [0.22, 1, 0.36, 1] }); });
-}
+// ---------- entrance ----------
 
-if (new URLSearchParams(location.search).has('sample')) $('sample').click();
+function intro() {
+  const root = document.documentElement;
+  const h1 = document.querySelector('.hero h1');
+  if (h1 && !h1.dataset.split) {
+    h1.dataset.split = '1';
+    h1.setAttribute('aria-label', h1.textContent);
+    h1.innerHTML = h1.textContent.split(' ').map((w) => `<span class="w" aria-hidden="true"><span>${w}</span></span>`).join(' ');
+  }
+  if (!fancy()) { root.classList.remove('pre'); return; }
+  const words = h1.querySelectorAll('.w > span');
+  const done = () => root.classList.remove('pre');
+  M.animate('.top', { opacity: [0, 1], x: [-10, 0] }, { duration: 0.6, ease });
+  M.animate(document.querySelector('.mark'), { rotate: [-180, 0], scale: [0.4, 1] }, { type: 'spring', stiffness: 160, damping: 14 });
+  M.animate(words, { y: ['110%', '0%'], rotate: [4, 0] }, { duration: 0.8, delay: M.stagger(0.07, { startDelay: 0.12 }), ease });
+  M.animate('.lede', { opacity: [0, 1], y: [14, 0] }, { duration: 0.7, delay: 0.55, ease });
+  M.animate('#drop', { opacity: [0, 1], y: [34, 0], scale: [0.94, 1] }, { type: 'spring', stiffness: 150, damping: 18, delay: 0.5 });
+  M.animate(corners, { opacity: [0, 1], x: (i) => [i % 2 ? 22 : -22, 0], y: (i) => [i < 2 ? -22 : 22, 0] }, { duration: 0.8, delay: M.stagger(0.07, { startDelay: 0.85 }), ease });
+  M.animate('#drop .inner > *', { opacity: [0, 1], y: [14, 0] }, { duration: 0.6, delay: M.stagger(0.09, { startDelay: 0.8 }), ease });
+  M.animate('#controls .field, #controls .chk, #dlall', { opacity: [0, 1], y: [14, 0] }, { duration: 0.6, delay: M.stagger(0.07, { startDelay: 1.05 }), ease });
+  M.inView('.notes', (el) => { M.animate(el, { opacity: [0, 1], y: [18, 0] }, { duration: 0.7, ease }); M.animate(el.querySelectorAll('.steps li'), { opacity: [0, 1], y: [16, 0] }, { duration: 0.6, delay: M.stagger(0.1, { startDelay: 0.15 }), ease }); });
+  // content is shown by the animations above; this only releases the pre-hide class once they are running
+  requestAnimationFrame(() => requestAnimationFrame(done));
+}
+intro();
+
+const qs = new URLSearchParams(location.search);
+if (qs.has('mode')) document.querySelector(`.seg[data-for=model] [data-v=${qs.get('mode')}]`)?.click();
+if (qs.get('sample') === 'logo') $('sample2').click(); else if (qs.has('sample')) $('sample').click();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});

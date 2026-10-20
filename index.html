@@ -14,6 +14,7 @@
 <script type="application/ld+json">
 {"@context":"https://schema.org","@type":"WebApplication","name":"Browser Background Remover","url":"https://davdd1.github.io/bgremove/","applicationCategory":"MultimediaApplication","operatingSystem":"Any","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"description":"Free background remover running fully in the browser."}
 </script>
+<script>try{if(!matchMedia('(prefers-reduced-motion: reduce)').matches){document.documentElement.classList.add('pre');setTimeout(function(){document.documentElement.classList.remove('pre')},3500)}}catch(e){}</script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -31,22 +32,25 @@
     <section id="drop" tabindex="0" aria-label="Drop images here">
       <span class="frame" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
       <div class="inner">
-        <p class="big">Drop images here</p>
+        <p class="big"><span class="t1">Drop images here</span><span class="t2" aria-hidden="true">Let go to cut them out</span></p>
         <p class="acts">
           <label class="btn primary"><input id="file" type="file" accept="image/*" multiple hidden>Choose images</label>
-          <button id="sample" class="btn ghost" type="button">Try a sample</button>
+          <button id="sample" class="btn ghost" type="button">Photo sample</button>
+          <button id="sample2" class="btn ghost" type="button">Logo sample</button>
         </p>
         <p class="hint">JPG, PNG or WebP. You can also paste.</p>
       </div>
     </section>
 
     <section id="controls" aria-label="Options">
-      <div class="field"><span class="lab">Subject</span>
-        <div class="seg" role="radiogroup" aria-label="Model" data-for="model">
-          <button type="button" role="radio" aria-checked="true" data-v="general">Object</button>
-          <button type="button" role="radio" aria-checked="false" data-v="portrait">Person</button>
+      <div class="field"><span class="lab">Mode</span>
+        <div class="seg" role="radiogroup" aria-label="Mode" data-for="model">
+          <button type="button" role="radio" aria-checked="true" data-v="auto" title="Picks the best method for each image">Auto</button>
+          <button type="button" role="radio" aria-checked="false" data-v="portrait" title="Light model tuned for people">Person</button>
+          <button type="button" role="radio" aria-checked="false" data-v="flat" title="Logos and screenshots on a plain background">Flat color</button>
+          <button type="button" role="radio" aria-checked="false" data-v="fast" title="Small bundled model, works offline right away">Quick</button>
         </div>
-        <select id="model" hidden><option value="general">General</option><option value="portrait">Portrait</option></select>
+        <select id="model" hidden><option value="auto">Auto</option><option value="portrait">Person</option><option value="flat">Flat color</option><option value="fast">Quick</option></select>
       </div>
       <div class="field"><span class="lab">Background</span>
         <div class="seg" role="radiogroup" aria-label="Background" data-for="bg">
@@ -58,7 +62,7 @@
       </div>
       <label class="field" id="colorLabel" hidden><span class="lab">Color</span><input id="color" type="color" value="#ffffff"></label>
       <label class="field" id="blurLabel" hidden><span class="lab">Blur</span><input id="blur" type="range" min="2" max="40" value="14"></label>
-      <label class="chk"><input id="crisp" type="checkbox" checked><span class="box" aria-hidden="true"></span>Crisp edges</label>
+      <label class="chk"><input id="crisp" type="checkbox"><span class="box" aria-hidden="true"></span>Crisp edges</label>
       <button id="dlall" class="btn ghost" type="button" disabled>Download all</button>
     </section>
 
@@ -70,22 +74,24 @@
     <h2>How it works</h2>
     <ol class="steps">
       <li><b>Drop</b>One image or a whole batch. They are processed one after another.</li>
-      <li><b>Wait</b>A segmentation model runs on your own device, a few seconds per image.</li>
+      <li><b>Wait</b>The image is scanned on your own device. Flat logos are cut by color in a blink, photos go through an AI model.</li>
       <li><b>Compare and save</b>Drag the slider, pick a new background if you want one, download the PNG.</li>
     </ol>
     <div class="faq">
       <details><summary>Is it really free and private?</summary>
-        <p>Yes. There is no server: the model is downloaded once and runs locally with WebAssembly. No image is sent anywhere, there is no account, no watermark, and no limit on resolution beyond your device memory.</p></details>
+        <p>Yes. There is no server: the image never leaves your device, there is no account, no watermark, and no limit on resolution beyond your device memory. The only download is the AI model itself, fetched once and kept in your browser.</p></details>
       <details><summary>Which models does it use?</summary>
-        <p>U<sup>2</sup>-Netp for general subjects and MODNet for portraits, both Apache-2.0 licensed, so results can be used commercially. It does well on clear subjects and worse on hair, glass and cluttered scenes.</p></details>
+        <p>Photos use ISNet (DIS, Apache-2.0, MIT-licensed ONNX conversion), a model built for cluttered scenes and fine edges. It runs on your graphics card through WebGPU when available, otherwise on the CPU. Person mode uses MODNet and Quick mode uses U<sup>2</sup>-Netp (both Apache-2.0). Logos and screenshots with a plain or smoothly shaded background skip the AI and are cut by color, which gives pixel-clean edges.</p></details>
+      <details><summary>Why is the first photo slower?</summary>
+        <p>ISNet is an 88 MB download (176 MB when it runs on WebGPU) from huggingface.co, only the first time. After that it comes from your browser cache. Without WebGPU, expect a while per photo. Quick mode works immediately and offline.</p></details>
       <details><summary>Does it work offline?</summary>
-        <p>After the first visit the page, the runtime and the models are cached by your browser, so it keeps working without internet.</p></details>
+        <p>After the first visit the page, the runtime and the two small models are cached, so Quick and Person mode and flat-color cuts work without internet. The BiRefNet model works offline once it has been downloaded.</p></details>
     </div>
   </section>
 
-  <footer>No tracking. Models: U<sup>2</sup>-Net and MODNet (Apache-2.0). Runtime: ONNX Runtime Web (MIT). Motion by Motion.dev (MIT).</footer>
+  <footer>No tracking. Models: ISNet, MODNet and U<sup>2</sup>-Netp (Apache-2.0). Runtime: ONNX Runtime Web (MIT). Motion by Motion.dev (MIT).</footer>
 </div>
-<script src="vendor/ort.wasm.min.js"></script>
+<script src="vendor/ort.webgpu.min.js"></script>
 <script src="vendor/motion.js"></script>
 <script type="module" src="app.js"></script>
 </body>
