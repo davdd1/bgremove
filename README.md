@@ -1,13 +1,20 @@
 # bgremove
 
-Free background remover that runs fully in the browser (static site, no server).
+Remove the background from a photo without uploading it. Everything runs in the browser, so the image never leaves your device, and it keeps working offline after the first visit.
 
-Run: `python3 -m http.server 8000 --bind 127.0.0.1` in this directory, open http://127.0.0.1:8000.
-Test: `node --test tests/lib.test.mjs`
+Live: https://davdd1.github.io/bgremove/
 
-Models (self-hosted in `models/`, both Apache-2.0, commercial use allowed):
-- `u2netp.onnx` 4.4 MB: U2-Net-small, https://github.com/xuebinqin/U-2-Net (ONNX from rembg release v0.0.0)
-- `modnet.onnx` 6.3 MB: MODNet quantized, https://github.com/ZHKKKe/MODNet (ONNX from huggingface Xenova/modnet)
+![bgremove with the sample photo processed](docs/screenshot.png)
 
-Runtime in `vendor/`: onnxruntime-web 1.22.0 (MIT). Sample `samples/dog.jpg`: CC0, Wikimedia Commons "Boxer (dog) , Iran 08.jpg" (Mostafa Meraji).
-RMBG-1.4/2.0 are avoided (non-commercial licenses).
+## Run it
+
+    python3 -m http.server 8000 --bind 127.0.0.1
+
+Open http://127.0.0.1:8000. Tests: `node --test tests/lib.test.mjs`.
+
+## What is in here
+
+- `models/`: U2-Netp (objects) and MODNet (people), both Apache-2.0, so commercial use is fine. RMBG is left out on purpose, its license is non-commercial.
+- `vendor/`: ONNX Runtime Web 1.22.0 (MIT) and Motion 12.23.12 (MIT, `motion.js`, used for the small animations; skipped when reduced motion is on).
+- `samples/dog.jpg`: CC0, "Boxer (dog), Iran 08.jpg" by Mostafa Meraji, Wikimedia Commons.
+- `sw.js`: caches everything for offline use. Bump `CACHE` when you change a file.

@@ -5,6 +5,12 @@ const ort = window.ort;
 ort.env.wasm.wasmPaths = new URL('vendor/', location.href).href;
 ort.env.wasm.numThreads = 1; // SHORTCUT: single thread avoids COOP/COEP headers; enable threads if hosting sets them
 
+// Motion is optional: without it (or with reduced motion) everything still works, just without easing.
+const M = window.Motion;
+const calm = matchMedia('(prefers-reduced-motion: reduce)');
+const spring = { type: 'spring', stiffness: 320, damping: 26 };
+const anim = (el, kf, opt) => (M && !calm.matches ? M.animate(el, kf, opt) : null);
+
 const sessions = {};
 const items = [];
 let queue = Promise.resolve();
@@ -80,26 +86,53 @@ function render(it) {
 function makeCard(it) {
   const el = document.createElement('div');
   el.className = 'card';
-  el.innerHTML = `<div class="cmp"><div class="ph">Queued...</div></div>
+  el.innerHTML = `<div class="cmp"><div class="ph busy">Working on it</div></div>
     <div class="row"><span></span><button class="btn" disabled>Download PNG</button></div>`;
-  el.querySelector('span').textContent = it.name;
+  el.querySelector('.row span').textContent = it.name;
   it.el = el;
   el.querySelector('button').onclick = () => download(it);
   $('results').append(el);
+  anim(el, { opacity: [0, 1], y: [18, 0], scale: [0.98, 1] }, spring);
 }
 
 function attachSlider(it) {
   const cmp = it.el.querySelector('.cmp');
   const before = it.orig; before.className = 'before';
   const handle = document.createElement('div'); handle.className = 'handle';
-  cmp.append(before, handle);
-  const set = (clientX) => {
-    const r = cmp.getBoundingClientRect();
-    const p = Math.min(1, Math.max(0, (clientX - r.left) / r.width)) * 100;
-    before.style.clipPath = `inset(0 ${100 - p}% 0 0)`; handle.style.left = p + '%';
+  handle.innerHTML = '<div class="knob"></div>';
+  const knob = handle.firstChild;
+  const tl = document.createElement('span'); tl.className = 'tag l'; tl.textContent = 'Before';
+  const tr = document.createElement('span'); tr.className = 'tag r'; tr.textContent = 'After';
+  cmp.append(before, handle, tl, tr);
+  cmp.tabIndex = 0; cmp.setAttribute('role', 'slider'); cmp.setAttribute('aria-label', 'Before and after');
+  cmp.setAttribute('aria-valuemin', '0'); cmp.setAttribute('aria-valuemax', '100');
+  let pos = 50, sweep = null;
+  const put = (p) => {
+    pos = Math.min(100, Math.max(0, p));
+    before.style.clipPath = `inset(0 ${100 - pos}% 0 0)`; handle.style.left = pos + '%';
+    tl.style.opacity = pos < 14 ? 0 : 1; tr.style.opacity = pos > 86 ? 0 : 1;
+    cmp.setAttribute('aria-valuenow', Math.round(pos));
   };
-  cmp.addEventListener('pointerdown', (e) => { cmp.setPointerCapture(e.pointerId); set(e.clientX); cmp.onpointermove = (ev) => set(ev.clientX); });
-  cmp.addEventListener('pointerup', () => { cmp.onpointermove = null; });
+  const fromX = (x) => { const r = cmp.getBoundingClientRect(); return (x - r.left) / r.width * 100; };
+  const glide = (to) => {
+    if (sweep) sweep.stop();
+    if (!M || calm.matches) return put(to);
+    sweep = M.animate(pos, to, { ...spring, onUpdate: put });
+  };
+  cmp.addEventListener('pointerdown', (e) => {
+    if (sweep) sweep.stop();
+    cmp.setPointerCapture(e.pointerId); glide(fromX(e.clientX));
+    anim(knob, { scale: 1.18 }, spring);
+    cmp.onpointermove = (ev) => { if (sweep) sweep.stop(); put(fromX(ev.clientX)); };
+  });
+  const up = () => { cmp.onpointermove = null; anim(knob, { scale: 1 }, spring); };
+  cmp.addEventListener('pointerup', up); cmp.addEventListener('pointercancel', up);
+  cmp.addEventListener('keydown', (e) => {
+    const k = { ArrowLeft: -5, ArrowRight: 5, Home: -100, End: 100 }[e.key];
+    if (k === undefined) return; e.preventDefault(); glide(pos + k);
+  });
+  // first reveal: start on the original and sweep to the cut-out so the comparison explains itself
+  if (M && !calm.matches) { put(100); setTimeout(() => glide(50), 250); } else put(50);
 }
 
 function download(it) {
@@ -120,6 +153,7 @@ function updateStatus() {
 }
 
 function addFile(file) {
+  drop.classList.add('compact'); document.body.classList.add('used');
   const it = { name: file.name || 'image', file };
   items.push(it); makeCard(it); updateStatus();
   queue = queue.then(async () => {
@@ -130,8 +164,9 @@ function addFile(file) {
       Object.assign(it, r, { bmp, ms: Math.round(performance.now() - t0) });
       it.el.querySelector('.cmp').innerHTML = '';
       render(it); attachSlider(it);
+      anim(it.el.querySelector('.cmp canvas.after'), { opacity: [0, 1] }, { duration: 0.4 });
       it.el.querySelector('button').disabled = false;
-      it.el.querySelector('span').textContent = `${it.name} (${it.ms} ms)`;
+      it.el.querySelector('.row span').textContent = `${it.name} · ${(it.ms / 1000).toFixed(1)} s`;
     } catch (e) {
       it.failed = true; it.el.querySelector('.cmp').innerHTML = '<div class="ph">Could not process this file.<br><small></small></div>'; it.el.querySelector('small').textContent = String(e.message || e);
       console.error(e);
@@ -143,20 +178,49 @@ function addFile(file) {
 function addFiles(list) { for (const f of list) if (f.type.startsWith('image/')) addFile(f); }
 
 const drop = $('drop');
-['dragenter', 'dragover'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add('over'); }));
-['dragleave', 'drop'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove('over'); }));
+const frame = drop.querySelector('.frame');
+const lock = (on) => anim(frame, { scale: on ? 1.035 : 1 }, spring);
+['dragenter', 'dragover'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); if (!drop.classList.contains('over')) { drop.classList.add('over'); lock(true); } }));
+['dragleave', 'drop'].forEach((t) => drop.addEventListener(t, (e) => { e.preventDefault(); if (drop.classList.contains('over')) { drop.classList.remove('over'); lock(false); } }));
+drop.addEventListener('pointerenter', () => { if (!drop.classList.contains('over')) anim(frame, { scale: 1.015 }, spring); });
+drop.addEventListener('pointerleave', () => { if (!drop.classList.contains('over')) anim(frame, { scale: 1 }, spring); });
 drop.addEventListener('drop', (e) => addFiles(e.dataTransfer.files));
 document.addEventListener('paste', (e) => addFiles(e.clipboardData?.files || []));
 $('file').onchange = (e) => { addFiles(e.target.files); e.target.value = ''; };
 $('sample').onclick = async () => { const b = await (await fetch('samples/dog.jpg')).blob(); addFiles([new File([b], 'sample.jpg', { type: b.type })]); };
 $('dlall').onclick = () => items.filter((i) => i.out).forEach((i, n) => setTimeout(() => download(i), n * 400)); // SHORTCUT: sequential downloads, no zip; add a zip writer for big batches
 
+function reveal(el, show) {
+  if (!show) { el.hidden = true; return; }
+  const was = el.hidden; el.hidden = false;
+  if (was) anim(el, { opacity: [0, 1], x: [-8, 0] }, spring);
+}
+
+document.querySelectorAll('.seg').forEach((seg) => {
+  const sel = $(seg.dataset.for);
+  seg.addEventListener('click', (e) => {
+    const b = e.target.closest('button'); if (!b) return;
+    seg.querySelectorAll('button').forEach((x) => x.setAttribute('aria-checked', String(x === b)));
+    sel.value = b.dataset.v; sel.dispatchEvent(new Event('input'));
+  });
+  seg.addEventListener('keydown', (e) => {
+    const d = { ArrowRight: 1, ArrowDown: 1, ArrowLeft: -1, ArrowUp: -1 }[e.key]; if (!d) return;
+    const bs = [...seg.querySelectorAll('button')]; const i = bs.findIndex((x) => x.getAttribute('aria-checked') === 'true');
+    const n = bs[(i + d + bs.length) % bs.length]; e.preventDefault(); n.click(); n.focus();
+  });
+});
+
 function syncBg() {
   const m = $('bg').value;
-  $('colorLabel').hidden = m !== 'color'; $('blurLabel').hidden = m !== 'blur';
+  reveal($('colorLabel'), m === 'color'); reveal($('blurLabel'), m === 'blur');
   items.forEach(render);
 }
 ['bg', 'color', 'blur'].forEach((id) => $(id).addEventListener('input', syncBg));
+
+if (M && !calm.matches) {
+  M.animate('.top, .hero h1, .lede, #drop', { opacity: [0, 1], y: [10, 0] }, { duration: 0.6, delay: M.stagger(0.07), ease: [0.22, 1, 0.36, 1] });
+  M.inView('.notes', (el) => { M.animate(el, { opacity: [0, 1], y: [14, 0] }, { duration: 0.6, ease: [0.22, 1, 0.36, 1] }); });
+}
 
 if (new URLSearchParams(location.search).has('sample')) $('sample').click();
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
